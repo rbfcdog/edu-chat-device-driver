@@ -1,77 +1,175 @@
-# `edu_chat`: chat educacional em um pseudo device driver Linux
+# edu_chat: an educational Linux character device
 
-`edu_chat` é um pseudo device driver educacional para o Kernel Linux. Ele cria
-o character device `/dev/edu_chat` e simula uma sala de chat local entre
-processos em user space.
+`edu_chat` is a personal learning project for developers exploring Linux character-device drivers and the user/kernel boundary. It exposes `/dev/edu_chat`: local processes write bytes into a shared kernel buffer and read them back through ordinary file operations. A small C terminal client presents those bytes as a chat demonstration.
 
-A ideia é simples: um processo escreve uma mensagem em `/dev/edu_chat`, o
-driver copia essa mensagem para um buffer em memória do kernel com
-`copy_from_user()`, e outros processos recuperam as mensagens com `read()`,
-usando `copy_to_user()` no caminho de volta.
+**This is a bounded shared-buffer experiment, not production messaging.** It has no accounts, private rooms, durable storage, message framing, or delivery guarantees. It is intended for disposable Linux virtual machines, not a host or a multi-user service.
 
-Além do requisito mínimo de buffer, o driver demonstra recursos usados em
-drivers reais:
+- [Build and run in a disposable VM](#standalone-build-and-run-in-a-disposable-vm)
+- [Optional in-tree kernel integration](#optional-in-tree-kernel-integration)
+- [Further work and acceptance goals](ROADMAP.md)
+- [Licensing](#license-and-provenance), [provenance](PROVENANCE.md), and [CC-CLI submission context](CC_CLI_PROJECT_SUBMISSION.md)
 
-- comandos `ioctl()` para consulta e configuração estruturada;
-- atributos `sysfs` para configuração simples e diagnóstico;
-- modo append para acumular mensagens como histórico de conversa;
-- modo clear-on-read para consumir mensagens após leitura;
-- leitura bloqueante para esperar novas mensagens;
-- suporte a `poll()`/`select()`;
-- estatísticas internas de uso;
-- cliente interativo em C para troca de mensagens entre dois terminais.
+## Current behavior
 
-Este repositório contém apenas o código do driver, a UAPI, os programas de
-teste e o patch de integração. A pasta `docs/` do projeto principal não foi
-incluída.
+The implementation includes:
 
-## Arquivos
+| Interface | Current behavior |
+| --- | --- |
+| Character device | Dynamically registered `cdev`, user/kernel copies, and per-open read positions. |
+| Buffer | One allocation at module load: default 4,096 bytes, maximum 65,536 bytes. A separate logical limit can be changed without reallocating. |
+| Writes | Replace the shared contents by default; global append mode accumulates bytes until the logical limit is reached. This is not a ring buffer. |
+| Reads | Read from the descriptor's position. At the current end, return zero by default; with the global blocking-read flag, wait, or return `EAGAIN` for an `O_NONBLOCK` descriptor. |
+| Clear-on-read | Optionally clear the entire shared buffer when a read reaches its end; this is not a separate queue for each reader. |
+| Events | A wait queue supports blocking reads and `poll()`/`select()` readiness. Write readiness reports some available space, not that an arbitrary message will fit. |
+| Control | `ioctl()` commands get information/statistics, clear contents, and set the global limit/flags. Sysfs exposes `limit`, `flags`, `length`, `stats`, and `clear`. |
+| Programs | An observational selftest and an interactive C client using `poll()`. The client's prompts are currently in Portuguese. |
 
-```text
-drivers/lkcamp/Kconfig
-drivers/lkcamp/Makefile
-drivers/lkcamp/edu_chat_core.c
-drivers/lkcamp/edu_chat_fops.c
-drivers/lkcamp/edu_chat_sysfs.c
-drivers/lkcamp/edu_chat_internal.h
-include/uapi/linux/edu_chat.h
-tools/testing/selftests/edu_chat/Makefile
-tools/testing/selftests/edu_chat/edu_chat_test.c
-tools/testing/selftests/edu_chat/edu_chat_client.c
-kernel-integration.patch
-```
+Flags start at zero and affect **all** open descriptors: append is `0x1`, clear-on-read is `0x2`, and blocking-read is `0x4`. The logical limit starts at the allocated capacity. A write larger than the limit returns `EMSGSIZE`; an append that exceeds remaining space returns `ENOSPC`. Appending does not reset the writer's read position. Clearing or shrinking the shared buffer does not reset every other descriptor's position.
 
-## O que cada parte faz
+The shared mutex protects buffer operations and metadata, but that is not proof of correct multi-process event or cursor semantics. Concurrent readers/writers, clear/shrink transitions, failed user-memory copies, and cursor recovery remain areas for investigation and regression coverage; see [ROADMAP.md](ROADMAP.md).
 
-- `edu_chat_core.c`: inicialização, saída, alocação do buffer, registro do
-  `cdev`, criação de `/dev/edu_chat` e integração com `sysfs`.
-- `edu_chat_fops.c`: implementação de `open`, `release`, `read`, `write`,
-  `poll` e `ioctl`.
-- `edu_chat_sysfs.c`: atributos `limit`, `flags`, `length`, `stats` e `clear`.
-- `edu_chat_internal.h`: declarações internas compartilhadas entre os arquivos
-  do módulo.
-- `edu_chat.h`: header UAPI usado pelo kernel e pelos programas de user space.
-- `edu_chat_test.c`: selftest que valida leitura, escrita, `ioctl`, `poll`,
-  flags e estatísticas.
-- `edu_chat_client.c`: cliente interativo que transforma o driver em uma sala
-  de chat entre dois terminais.
+### Security and data handling
 
-## Aplicando em uma árvore do Kernel Linux
+The driver requests device-node mode **`0666`**. Unless the guest's device-management policy overrides it, any local user can read or overwrite the shared bytes, clear them, and change global behavior through `ioctl()`; these operations do not require administrative privileges. Sysfs configuration normally requires root, but it is not an authorization boundary for the equivalent ioctls.
 
-A partir da raiz de uma árvore compatível do Kernel Linux:
+**There is no confidentiality or isolation between local users.** Use only synthetic, non-sensitive input in a disposable VM with no untrusted users. Do not type credentials or personal conversations. The device accepts arbitrary local bytes; absence of committed chat logs would not certify that real data has never been used. Kernel code can compromise or crash its guest, and clearing this buffer is not a secure-erasure guarantee.
+
+## Source map
+
+| File | Responsibility |
+| --- | --- |
+| [`drivers/lkcamp/edu_chat_core.c`](drivers/lkcamp/edu_chat_core.c) | Allocation, registration, `0666` node policy, initialization and teardown. |
+| [`drivers/lkcamp/edu_chat_fops.c`](drivers/lkcamp/edu_chat_fops.c) | Read/write, per-open positions, readiness and ioctls. |
+| [`drivers/lkcamp/edu_chat_sysfs.c`](drivers/lkcamp/edu_chat_sysfs.c) | Sysfs controls and statistics. |
+| [`drivers/lkcamp/edu_chat_internal.h`](drivers/lkcamp/edu_chat_internal.h) | Internal shared declarations. |
+| [`include/uapi/linux/edu_chat.h`](include/uapi/linux/edu_chat.h) | Public flags, limits, ioctl numbers and payload layouts. |
+| [`tools/testing/selftests/edu_chat/`](tools/testing/selftests/edu_chat/) | C selftest, terminal client and userspace Makefile. |
+| [`kernel-integration.patch`](kernel-integration.patch) | Hooks for an existing Linux source tree; not a complete source patch. |
+
+## Standalone build and run in a disposable VM
+
+### Prerequisites
+
+Create a disposable Linux VM/snapshot first. **Run every command below inside that guest**, including module loading. Do not load this module into your workstation's kernel. Avoid shared folders containing sensitive host data.
+
+The guest needs:
+
+- Git, GNU Make, a C compiler and libc development headers for the programs.
+- A kernel-module build toolchain and matching, prepared headers/build tree for the **guest's running kernel**, normally at `/lib/modules/$(uname -r)/build`. Distribution packages may also require tools such as binutils or libelf development files.
+- Kernel module loading support, `kmod` (`insmod`, `modinfo`), and administrator access within the guest. Guest Secure Boot/module-signing policy must permit the module; do not disable host protections for this demo.
+- Device management such as devtmpfs/udev to create `/dev/edu_chat`, mounted sysfs, and `timeout` from GNU coreutils for the bounded selftest invocation below.
+
+Kernel APIs vary. This source uses the one-argument `class_create()` API; compatibility with every kernel release is not promised. Use headers compatible with the source and matching the guest kernel, or use the in-tree workflow to build and boot a suitable guest kernel.
+
+### Clone and build
 
 ```sh
-cp -r /path/to/edu-chat-device-driver/drivers/lkcamp drivers/
-cp /path/to/edu-chat-device-driver/include/uapi/linux/edu_chat.h include/uapi/linux/
-mkdir -p tools/testing/selftests/edu_chat
-cp /path/to/edu-chat-device-driver/tools/testing/selftests/edu_chat/* \
-    tools/testing/selftests/edu_chat/
-git apply /path/to/edu-chat-device-driver/kernel-integration.patch
+git clone https://github.com/rbfcdog/edu-chat-device-driver.git
+cd edu-chat-device-driver
+
+make -C /lib/modules/"$(uname -r)"/build \
+  M="$PWD/drivers/lkcamp" \
+  CONFIG_EDU_CHAT=m \
+  KCFLAGS="-I$PWD/include" \
+  modules
+
+make -C tools/testing/selftests/edu_chat
 ```
 
-## Compilação
+The module Makefile uses `CONFIG_EDU_CHAT` to select the composite module, so the external build must pass `CONFIG_EDU_CHAT=m`. The include flag supplies the repository's `<uapi/linux/edu_chat.h>` to the kernel build. The userspace Makefile supplies `include/uapi` itself and, outside a full kernel tree, builds both `edu_chat_test` and `edu_chat_client` with its standalone fallback. This workflow does **not** need `kernel-integration.patch` or installation into system directories.
 
-Para compilar pela própria árvore do kernel:
+Expected output paths are `drivers/lkcamp/edu_chat.ko` and the two programs under `tools/testing/selftests/edu_chat/`. These are build targets, not a claim that a particular environment has been verified.
+
+### Load and inspect — guest only
+
+Start from a fresh VM boot with no existing `edu_chat` instance. Inspect the guest identity and module metadata before loading:
+
+```sh
+uname -r
+modinfo drivers/lkcamp/edu_chat.ko
+sudo insmod drivers/lkcamp/edu_chat.ko capacity=4096
+ls -l /dev/edu_chat
+cat /sys/class/edu_chat/edu_chat/limit
+cat /sys/class/edu_chat/edu_chat/flags
+```
+
+The initial limit should be `4096` and flags `0x0` for this load. If the module is already loaded, do not blindly remove it: use a fresh guest boot or explicitly identify its owner and open handles. `Invalid module format` usually calls for checking the guest kernel/build-tree match and module metadata; inspect the guest kernel log for the actual reason. A missing node calls for checking the guest's device-management setup and module initialization log, not guessing a major number.
+
+### Minimal byte-buffer demonstration
+
+With the freshly loaded default flags and no other clients:
+
+```sh
+printf 'alice: hello from the guest\n' > /dev/edu_chat
+cat /dev/edu_chat
+cat /sys/class/edu_chat/edu_chat/length
+cat /sys/class/edu_chat/edu_chat/stats
+```
+
+In default overwrite mode, a new open reads the stored bytes and then reaches the current end. Reading does not normally delete them. If another process enables blocking-read mode, `cat` can instead wait at the end; stop that specific foreground command with Ctrl+C.
+
+### Existing selftest
+
+Close the clients first: this program changes global flags/limit and clears all contents. Run it only against this disposable guest instance:
+
+```sh
+timeout 10s ./tools/testing/selftests/edu_chat/edu_chat_test /dev/edu_chat
+```
+
+The selftest exercises writes, reads, ioctls, `poll()`, clear-on-read, limit changes and statistics. It checks syscall failures and full writes, and explicitly checks for `EAGAIN` on an empty nonblocking read with blocking-read mode enabled. Most content, readiness and statistics checks **print observations rather than assert expected values**. A zero exit status is not comprehensive regression or concurrency evidence. A timeout is a failure to investigate, not a successful test. See the bounded execution evidence below.
+
+### Two-terminal client demonstration
+
+After the selftest and before opening either client, reset the demo's shared state:
+
+```sh
+printf '4096\n' | sudo tee /sys/class/edu_chat/edu_chat/limit >/dev/null
+printf '0x1\n' | sudo tee /sys/class/edu_chat/edu_chat/flags >/dev/null
+printf 'clear\n' | sudo tee /sys/class/edu_chat/edu_chat/clear >/dev/null
+```
+
+In two terminals **inside the same guest**, from the repository root:
+
+```sh
+# Terminal A
+./tools/testing/selftests/edu_chat/edu_chat_client /dev/edu_chat alice
+```
+
+```sh
+# Terminal B
+./tools/testing/selftests/edu_chat/edu_chat_client /dev/edu_chat bob
+```
+
+Each client opens `O_RDWR | O_NONBLOCK`, sets the global flags to append-only, drains existing bytes from its own cursor without displaying them, and polls the keyboard and device. Open both clients before sending short synthetic lines; use short nicknames too. Exit each foreground client with Ctrl+C.
+
+This is not unlimited chat history: reads in append-only mode do not free space, and the client exits on a failed write when the buffer fills. It does not implement queued/retried writes or robust formatting-length handling. Clearing or shrinking underneath active readers needs further cursor/event work; stop both clients before resetting the demonstration. EOF/hangup handling and backpressure are also backlog items, not verified features.
+
+### End the session safely
+
+Close each foreground client or reader explicitly. Do not kill processes by broad name/pattern and do not force module removal. The simplest cleanup for this workflow is to shut down and discard/revert the disposable VM. If investigating a module-in-use error, identify the particular processes holding `/dev/edu_chat` and close only those you started; a fresh guest avoids relying on blind unload/reload commands.
+
+## Optional in-tree kernel integration
+
+This is a **different workflow** for someone already comfortable building and booting a Linux kernel in a VM. It requires a separate, compatible, configured Linux source tree and its normal kernel-build dependencies. Run the following from that tree's root, not from this repository:
+
+```sh
+REPO=/absolute/path/to/edu-chat-device-driver
+
+# Check the hook patch against this kernel revision before copying files.
+git apply --check "$REPO/kernel-integration.patch"
+
+# Use a clean tree with neither destination directory already present.
+test ! -e drivers/lkcamp && test ! -e tools/testing/selftests/edu_chat && \
+  test ! -e include/uapi/linux/edu_chat.h && \
+  cp -R "$REPO/drivers/lkcamp" drivers/ && \
+  cp "$REPO/include/uapi/linux/edu_chat.h" include/uapi/linux/ && \
+  cp -R "$REPO/tools/testing/selftests/edu_chat" tools/testing/selftests/ && \
+  git apply "$REPO/kernel-integration.patch"
+```
+
+Stop on a failed check or copy. The patch only adds hooks to `drivers/Kconfig`, `drivers/Makefile`, and `tools/testing/selftests/Makefile`; it does **not** contain the copied driver, UAPI or program files. Its context is kernel-revision-specific. Do not apply it twice, add duplicate hooks manually, or repeat `cp -R` into existing destination directories: that can create nested copies such as `drivers/lkcamp/lkcamp`. Inspect and reconcile an existing integration instead.
+
+With the copy and hooks successfully integrated into an already configured kernel tree:
 
 ```sh
 ./scripts/config -m EDU_CHAT
@@ -80,128 +178,43 @@ make -j"$(nproc)" drivers/lkcamp/edu_chat.ko
 make -C tools/testing/selftests/edu_chat
 ```
 
-Para compilar contra o kernel que está rodando no host:
+Inside a full kernel tree, the program Makefile uses `tools/testing/selftests/lib.mk` rather than its standalone fallback; follow that kernel tree's exported-header preparation requirements. Building a module for a new kernel does not make it loadable into the guest's old running kernel. Build/install and boot the corresponding kernel **in the disposable VM** using that tree's normal procedure before following the guest-only runtime steps above. Neither workflow here installs or modifies the host kernel.
 
-```sh
-make -C /lib/modules/$(uname -r)/build \
-  M=$PWD/drivers/lkcamp \
-  CONFIG_EDU_CHAT=m \
-  KCFLAGS=-I$PWD/include \
-  modules
+## License and provenance
 
-make -C tools/testing/selftests/edu_chat
-```
+The driver, C programs and build files retain their **GPL-2.0-only** notices; see [LICENSE](LICENSE). The exported header retains its distinct SPDX identifier, **`GPL-2.0 WITH Linux-syscall-note`**; see [COPYING.Linux-syscall-note](COPYING.Linux-syscall-note). That UAPI exception is not a blanket relicensing of the driver or client.
 
-## Execução rápida
+See [PROVENANCE.md](PROVENANCE.md) for tutorial/upstream origins and contribution boundaries, and [CC_CLI_PROJECT_SUBMISSION.md](CC_CLI_PROJECT_SUBMISSION.md) for the personal-learning submission context. GPL-family licensing requires organizer approval **before paid CC-CLI sessions**; inclusion of these documents does not constitute approval.
 
-Use uma VM ou sistema rodando a mesma versão/configuração do kernel usada para
-compilar o módulo. Se o `vermagic` do módulo não corresponder ao `uname -r`, o
-`insmod` pode falhar com `Invalid module format`.
+## Verification for this submission preparation
 
-```sh
-sudo rmmod edu_chat 2>/dev/null || true
+The standalone commands above built `edu_chat.ko`, `edu_chat_test`, and
+`edu_chat_client` against the `7.0.0-38-generic` prepared headers using GCC 13
+for the module and the host C compiler for the programs. The build warned about
+the compiler executable's name, unavailable `pahole`, and skipped BTF generation
+because no `vmlinux` was supplied; the module still linked successfully.
 
-sudo insmod drivers/lkcamp/edu_chat.ko capacity=4096
+That exact module and both programs were exercised in a disposable QEMU/KVM
+guest booting the matching kernel image, with a minimal initramfs and networking
+disabled. No host module was loaded. The guest observed:
 
-lsmod | grep edu_chat
-ls -l /dev/edu_chat
-sudo dmesg -T | tail -n 20
-```
+- an exact synthetic byte-message roundtrip through `/dev/edu_chat`;
+- successful completion of the existing selftest, including its `EAGAIN` check;
+- a blocking reader receiving a synthetic message written by another process;
+- the actual terminal client formatting and displaying a short synthetic message;
+- successful module unload and removal of its sysfs class.
 
-O driver configura o device node como `0666`, então os exemplos abaixo podem
-ser executados sem `sudo` depois do `insmod`.
+This is a smoke run, not concurrency stress, long-input safety, broad kernel
+compatibility, in-tree patch verification, or proof of all roadmap behavior.
+The full two-terminal interactive demonstration was not automated in this run.
 
-Teste uma escrita e uma leitura simples:
+Gitleaks 8.30.1, checked against its published archive SHA-256, reported zero
+credential matches in the existing Git history (21 commits scanned by the tool;
+22 commits in the repository). A source/history review found demonstration
+messages, not customer records or conversation logs. This is scoped evidence,
+not a guarantee that no secret or real data could ever be introduced. Author
+metadata and a historic local build path are not represented as credentials.
 
-```sh
-printf 'rodrigo: oi pessoal\n' > /dev/edu_chat
-cat /dev/edu_chat
-```
+## Changes in this submission preparation
 
-## Chat entre dois terminais
-
-Antes de abrir os clientes, limpe o histórico e deixe apenas o modo append
-ativo:
-
-```sh
-echo 4096 | sudo tee /sys/class/edu_chat/edu_chat/limit >/dev/null
-echo 0x1 | sudo tee /sys/class/edu_chat/edu_chat/flags >/dev/null
-echo clear | sudo tee /sys/class/edu_chat/edu_chat/clear >/dev/null
-```
-
-Terminal 1:
-
-```sh
-./tools/testing/selftests/edu_chat/edu_chat_client /dev/edu_chat rodrigo
-```
-
-Terminal 2:
-
-```sh
-./tools/testing/selftests/edu_chat/edu_chat_client /dev/edu_chat ana
-```
-
-O cliente abre `/dev/edu_chat` com `O_RDWR | O_NONBLOCK`, ativa append por
-`ioctl()` e usa `poll()` para esperar ao mesmo tempo pelo teclado e pelo device.
-Ao entrar, ele descarta silenciosamente o histórico antigo; depois disso, mostra
-somente mensagens novas. No driver, escritas em modo append não resetam o cursor
-de leitura do próprio descritor, evitando repetir a conversa inteira a cada
-mensagem enviada. No terminal, o cliente também apaga a linha crua que acabou de
-ser digitada e deixa visível apenas a versão formatada como `nickname: mensagem`.
-
-Exemplo esperado:
-
-```text
-Terminal rodrigo:
-rodrigo: ola
-ana: oieee
-
-Terminal ana:
-ana: oieee
-rodrigo: tudo bem?
-```
-
-## Teste com `ioctl()`
-
-```sh
-sudo tools/testing/selftests/edu_chat/edu_chat_test /dev/edu_chat
-```
-
-O selftest consulta informações, limpa o chat, ativa flags, escreve mensagens,
-usa `poll()`, lê dados, altera o limite lógico e consulta estatísticas.
-
-## Inspeção por `sysfs`
-
-```sh
-ls -l /sys/class/edu_chat/edu_chat/
-cat /sys/class/edu_chat/edu_chat/limit
-cat /sys/class/edu_chat/edu_chat/flags
-cat /sys/class/edu_chat/edu_chat/length
-cat /sys/class/edu_chat/edu_chat/stats
-echo clear | sudo tee /sys/class/edu_chat/edu_chat/clear
-```
-
-## Remoção
-
-```sh
-sudo rmmod edu_chat
-sudo dmesg -T | tail -n 20
-```
-
-Se aparecer `Module edu_chat is in use`, feche qualquer `cat /dev/edu_chat` ou
-`edu_chat_client` aberto em outro terminal:
-
-```sh
-ps -eo pid,ppid,stat,comm,args | grep -E 'cat /dev/edu_chat|edu_chat_client' | grep -v grep
-sudo pkill -f 'cat /dev/edu_chat'
-sudo pkill -f 'edu_chat_client'
-sudo rmmod edu_chat
-```
-
-## Resumo
-
-Para o usuário, `edu_chat` é um dispositivo virtual em `/dev/edu_chat` que
-funciona como uma sala de chat local. Para o projeto, ele demonstra os conceitos
-centrais de um character device driver: módulo carregável, `cdev`, major/minor,
-`file_operations`, cópia segura entre user space e kernel space, configuração
-por `ioctl()`/`sysfs`, sincronização e espera por eventos com `poll()`.
+Added canonical GPLv2 and UAPI-exception texts, source/provenance notes, the genuine robustness/usability backlog, a build-artifact ignore file, and application answers. Replaced the Portuguese overview with English reviewer-facing build, VM-safety, interface, security and test-scope documentation. No driver/client behavior or source licensing identifiers were changed; planned improvements remain future work.

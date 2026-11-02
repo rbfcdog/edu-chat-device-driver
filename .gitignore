@@ -1,0 +1,19 @@
+# Private local settings and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Kernel module build products
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Generated userspace programs
+/tools/testing/selftests/edu_chat/edu_chat_test
+/tools/testing/selftests/edu_chat/edu_chat_client
